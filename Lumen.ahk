@@ -1,9 +1,11 @@
 ;=====================================================================
 ; Lumen — переключатель режимов освещённости для игр
-; AutoHotkey v2. Меняет гамма-кривую монитора (SetDeviceGammaRamp).
+; AutoHotkey v2. Меняет гамма-кривую монитора (SetDeviceGammaRamp)
+; и, на видеокартах NVIDIA, насыщенность (Digital Vibrance).
 ; Кривые режимов лежат в папке curves\ (формат .crv3: индекс R G B).
 ; Любой .crv3 в этой папке становится режимом. Первая строка вида
-; «; Название» задаёт имя режима.
+; «; Название» задаёт имя режима, строка «; lumen: ...» — параметры
+; редактора.
 ; Настройки сохраняются в lumen.ini рядом со скриптом.
 ;=====================================================================
 #Requires AutoHotkey v2.0
@@ -14,6 +16,10 @@ SetWorkingDir A_ScriptDir
 global INI := A_ScriptDir "\lumen.ini"
 global CURVE_DIR := A_ScriptDir "\curves\"
 global MAX_MODES := 12                 ; стандарт + до 11 кривых
+global START_HIDDEN := false
+for a in A_Args
+    if a = "--tray"
+        START_HIDDEN := true
 
 ; Права администратора нужны, чтобы горячие клавиши срабатывали,
 ; когда игра запущена от администратора. Отключается в lumen.ini: RunAsAdmin=0
@@ -21,9 +27,9 @@ if !A_IsAdmin && IniRead(INI, "Main", "RunAsAdmin", "1") = "1"
     && !InStr(DllCall("GetCommandLine", "str"), " /restart") {
     try {
         if A_IsCompiled
-            Run '*RunAs "' A_ScriptFullPath '" /restart'
+            Run '*RunAs "' A_ScriptFullPath '" /restart' (START_HIDDEN ? " --tray" : "")
         else
-            Run '*RunAs "' A_AhkPath '" /restart "' A_ScriptFullPath '"'
+            Run '*RunAs "' A_AhkPath '" /restart "' A_ScriptFullPath '"' (START_HIDDEN ? " --tray" : "")
         ExitApp
     }
     ; если UAC отклонён — работаем без повышенных прав
@@ -31,6 +37,12 @@ if !A_IsAdmin && IniRead(INI, "Main", "RunAsAdmin", "1") = "1"
 
 ; иконка окна, трея и панели задач
 try TraySetIcon(A_ScriptDir "\lumen.ico")
+
+#Include lib\Tone.ahk
+#Include lib\Display.ahk
+#Include lib\Editor.ahk
+#Include lib\Cube.ahk
+#Include lib\Autostart.ahk
 
 ;---------------------------------------------------------------------
 ; Режимы
@@ -51,7 +63,7 @@ global C := {
 }
 
 global IDENTITY := MakeIdentity()
-global MODES := [], CURVES := []       ; MODES[i] — {name, file, id}; CURVES[i] — исходная кривая
+global MODES := [], CURVES := []       ; MODES[i] — {name, file, id, params, vib}; CURVES[i] — исходная кривая
 global SLOT_IDS := []                  ; слоты 1..N — режимы, N+1 — цикл вниз, N+2 — цикл вверх
 global cfg := {}
 global current := 1                    ; выбранный режим
@@ -61,22 +73,29 @@ global showing := true                 ; кривая режима на экра
 global registered := []
 global expected := 0, guardFails := 0  ; что должно стоять на мониторе (0 — стандарт, не следим)
 global TOUCHED := Map()                ; мониторы, которым Lumen менял кривую
+global VIB_ORIG := Map()               ; исходная насыщенность мониторов, которую меняли
+global VIB_EXPECT := Map()             ; какая насыщенность должна стоять сейчас
 global capturing := 0, captureHook := 0, pendingMouse := ""
 global detectLeft := 0
 global G := 0, ui := {}, OSD := 0, osdText := 0
-global CLICK_MAP := Map(), TIPS := Map(), tipHwnd := 0
+global CLICK_MAP := Map(), TIPS := Map(), tipHwnd := 0, ROW_OF := Map()
 
 LoadCurves()
 LoadConfig()
+RecoverVibrance()
 inGame := !OutsideGame()
 BuildGui()
 showing := inGame || !!WinActive("ahk_id " G.Hwnd)
 SelectMode(1, true)
 ApplyHotkeys()
+UpdateHdr()
 SetTimer(CheckGame, 250)
 SetTimer(GuardRamp, 1500)
 OnMessage(0x7E, OnDisplayChange)       ; WM_DISPLAYCHANGE
 OnMessage(0x218, OnPower)              ; WM_POWERBROADCAST
+OnMessage(0x114, EdScroll)             ; WM_HSCROLL — ползунки редактора
+OnMessage(0x201, EdMouse)              ; WM_LBUTTONDOWN — точки кривой
+OnMessage(0x203, EdMouse)              ; WM_LBUTTONDBLCLK
 OnExit(RestoreAll)
 
 ;=====================================================================
@@ -93,7 +112,7 @@ MakeIdentity() {
 }
 
 LoadCurves() {
-    MODES.Push({name: "Стандартная настройка", file: "", id: "Mode1"})
+    MODES.Push({name: "Стандартная настройка", file: "", id: "Mode1", params: "", vib: ""})
     CURVES.Push(IDENTITY)
 
     known := Map()
@@ -102,7 +121,7 @@ LoadCurves() {
     for b in BUILTIN {
         known[b.file] := true
         if FileExist(CURVE_DIR b.file)
-            list.Push({name: b.name, file: b.file, id: b.id})
+            list.Push({name: b.name, file: b.file, id: b.id, params: "", vib: ""})
     }
     extra := ""
     loop files CURVE_DIR "*.crv3"
@@ -111,7 +130,7 @@ LoadCurves() {
     if extra != ""
         for f in StrSplit(Sort(RTrim(extra, "`n")), "`n") {
             base := RegExReplace(f, "i)\.crv3$")
-            list.Push({name: base, file: f, id: "Curve_" RegExReplace(base, "[\s=\[\];]", "_")})
+            list.Push({name: base, file: f, id: "Curve_" RegExReplace(base, "[\s=\[\];]", "_"), params: "", vib: ""})
         }
 
     broken := "", skipped := 0
@@ -120,13 +139,16 @@ LoadCurves() {
             skipped++
             continue
         }
-        buf := ParseCurve(CURVE_DIR m.file, &title)
+        buf := ParseCurve(CURVE_DIR m.file, &title, &params)
         if !buf {
             broken .= "`n   curves\" m.file
             continue
         }
         if title != ""
             m.name := title
+        m.params := params
+        if RegExMatch(params, "(?:^|\|)vib=(\d+)", &vm)
+            m.vib := Integer(vm[1])
         MODES.Push(m), CURVES.Push(buf)
     }
 
@@ -142,14 +164,19 @@ LoadCurves() {
 }
 
 ; Возвращает буфер GAMMARAMP или 0, если файл неполный.
-; Первая строка-комментарий («; Название» или «# Название») — имя режима.
-ParseCurve(path, &title) {
-    title := ""
+; Первая строка-комментарий («; Название» или «# Название») — имя режима,
+; строка «; lumen: ...» — параметры редактора.
+ParseCurve(path, &title, &params) {
+    title := "", params := ""
     try text := FileRead(path, "UTF-8")
     catch
         return 0
     buf := Buffer(1536, 0), seen := Map()
     loop parse text, "`n", "`r" {
+        if RegExMatch(A_LoopField, "^\s*[;#]\s*lumen:\s*(.*?)\s*$", &pm) {
+            params := pm[1]
+            continue
+        }
         if A_Index = 1 && RegExMatch(A_LoopField, "^\s*[;#]\s*(?:name\s*[:=]\s*)?(.+?)\s*$", &t) {
             title := t[1]
             continue
@@ -180,8 +207,15 @@ MixedRamp(i) {
     return buf
 }
 
+IsBuiltin(i) {
+    for b in BUILTIN
+        if b.file = MODES[i].file
+            return true
+    return false
+}
+
 ;=====================================================================
-; Мониторы и гамма
+; Мониторы, гамма и насыщенность
 ;=====================================================================
 MonitorDevice(sel) {
     n := (sel >= 1 && sel <= MonitorGetCount()) ? sel : MonitorGetPrimary()
@@ -242,14 +276,66 @@ ApplyCurrent() {
     }
     expected := std ? 0 : buf
     guardFails := 0
+    ApplyVibrance(VibTarget())
     return ok
+}
+
+; Насыщенность, которая должна стоять сейчас ("" — исходная)
+VibTarget() {
+    if !showing
+        return ""
+    if MODES[current].vib != ""
+        return MODES[current].vib
+    return cfg.vibOn ? cfg.vib : ""
+}
+
+; level: 0..100 или "" — вернуть исходную
+ApplyVibrance(level) {
+    for dev in Devices() {
+        if level = "" {
+            if VIB_ORIG.Has(dev)
+                NvSetVib(dev, VIB_ORIG[dev])
+            if VIB_EXPECT.Has(dev)
+                VIB_EXPECT.Delete(dev)
+            continue
+        }
+        if !VIB_ORIG.Has(dev) {
+            o := NvGetVib(dev)
+            if o = ""
+                continue
+            VIB_ORIG[dev] := o
+            ; запоминаем на диске: если Lumen упадёт, при следующем запуске вернём как было
+            IniWrite(o, INI, "VibranceRestore", StrReplace(dev, "\\.\"))
+        }
+        if NvSetVib(dev, level)
+            VIB_EXPECT[dev] := level
+    }
+}
+
+; После аварийного завершения возвращает насыщенность, сохранённую в lumen.ini
+RecoverVibrance() {
+    try section := IniRead(INI, "VibranceRestore")
+    catch
+        return
+    loop parse section, "`n", "`r" {
+        if RegExMatch(A_LoopField, "^(.+?)=(\d+)$", &m)
+            NvSetVib("\\.\" m[1], Integer(m[2]))
+    }
+    try IniDelete(INI, "VibranceRestore")
 }
 
 ; Игра, драйвер или Windows могут сбросить кривую (смена разрешения,
 ; Alt+Tab, выход из сна) — проверяем и ставим заново
 GuardRamp() {
     global guardFails
-    if !expected || guardFails >= 3 || capturing
+    if editing || capturing
+        return
+    for dev, v in VIB_EXPECT {
+        cur := NvGetVib(dev)
+        if cur != "" && cur != v
+            NvSetVib(dev, v)
+    }
+    if !expected || guardFails >= 3
         return
     for dev in Devices() {
         if !RampMatches(dev, expected) {
@@ -264,9 +350,14 @@ GuardRamp() {
     guardFails := 0
 }
 
-Reapply() => ApplyCurrent()
+Reapply() {
+    UpdateHdr()
+    if !editing
+        ApplyCurrent()
+}
 
 OnDisplayChange(*) {
+    NV.handles.Clear()
     SetTimer(Reapply, -1000)
 }
 
@@ -278,6 +369,30 @@ OnPower(wParam, *) {
 RestoreAll(*) {
     for dev in TOUCHED
         SetRamp(dev, IDENTITY)
+    for dev, v in VIB_ORIG
+        NvSetVib(dev, v)
+    try IniDelete(INI, "VibranceRestore")
+}
+
+; В HDR гамма-кривые Windows не действуют — предупреждаем
+UpdateHdr() {
+    if !ui.HasProp("hdr")
+        return
+    on := false
+    for dev in Devices()
+        if HdrOn(dev)
+            on := true
+    ui.hdr.Text := on ? "HDR включён — кривые не действуют" : ""
+    TIPS[ui.hdr.Hwnd] := on ? "В режиме HDR Windows игнорирует гамма-кривые.`nВыключите HDR: Параметры → Система → Дисплей.`nНасыщенность NVIDIA при этом работает." : ""
+}
+
+RestartLumen() {
+    RestoreAll()
+    if A_IsCompiled
+        Run('"' A_ScriptFullPath '" /restart')
+    else
+        Run('"' A_AhkPath '" /restart "' A_ScriptFullPath '"')
+    ExitApp()
 }
 
 ;=====================================================================
@@ -292,6 +407,10 @@ LoadConfig() {
     cfg.lockOn := IniRead(INI, "Main", "LockToGame", "0") = "1"
     cfg.game := IniRead(INI, "Main", "GameWindow", "ahk_exe EscapeFromTarkov.exe")
     cfg.osd := IniRead(INI, "Main", "OSD", "1") = "1"
+    cfg.vibOn := IniRead(INI, "Main", "VibranceOn", "0") = "1"
+    v := IniRead(INI, "Main", "Vibrance", "70")
+    cfg.vib := IsInteger(v) ? Max(0, Min(100, Integer(v))) : 70
+    cfg.trayHint := IniRead(INI, "Main", "TrayHintShown", "0") = "1"
 
     for m in MODES
         SLOT_IDS.Push(m.id)
@@ -318,6 +437,9 @@ SaveConfig() {
     IniWrite(cfg.lockOn ? 1 : 0, INI, "Main", "LockToGame")
     IniWrite(cfg.game, INI, "Main", "GameWindow")
     IniWrite(cfg.osd ? 1 : 0, INI, "Main", "OSD")
+    IniWrite(cfg.vibOn ? 1 : 0, INI, "Main", "VibranceOn")
+    IniWrite(cfg.vib, INI, "Main", "Vibrance")
+    IniWrite(cfg.trayHint ? 1 : 0, INI, "Main", "TrayHintShown")
     for i, id in SLOT_IDS {
         IniWrite(cfg.keys[i], INI, "Keys", id)
         IniWrite(cfg.block[i] ? 1 : 0, INI, "Block", id)
@@ -356,7 +478,7 @@ OutsideGame() => cfg.lockOn && cfg.game != "" && !WinActive(cfg.game)
 ; Горячая клавиша режима. Вне игры ничего не делает: там и так стандарт,
 ; а выбранный режим вернётся, когда вы переключитесь обратно в игру.
 OnModeKey(i) {
-    if OutsideGame()
+    if editing || OutsideGame()
         return
     SelectMode(i)
     ShowOSD(MODES[i].name)
@@ -365,7 +487,7 @@ OnModeKey(i) {
 ; Цикл: выбирает следующий отмеченный режим, ещё не выбранный в этом круге.
 ; Когда круг пройден — начинается заново. Вниз: 1→N, вверх: N→1.
 OnCycleKey(dir) {
-    if OutsideGame()
+    if editing || OutsideGame()
         return
     n := MODES.Length
     loop 2 {
@@ -424,6 +546,8 @@ ApplyHotkeys() {
 
 CheckGame() {
     global inGame, showing
+    if editing
+        return
     ; внимание: имена в AHK не различают регистр, локальная «g» перекрыла бы окно G
     nowIn := !OutsideGame()
     ; окно Lumen активно — показываем выбранный режим, чтобы его можно было посмотреть
@@ -571,7 +695,8 @@ BuildGui() {
     G := Gui("-MaximizeBox", "Lumen")
     G.BackColor := C.bg
     G.MarginX := 0, G.MarginY := 0
-    G.OnEvent("Close", (*) => ExitApp())
+    G.OnEvent("Close", OnMainClose)
+    G.OnEvent("ContextMenu", OnMainContext)
     try DllCall("dwmapi\DwmSetWindowAttribute", "ptr", G.Hwnd, "int", 20, "int*", 1, "int", 4)
 
     ; шапка
@@ -581,6 +706,8 @@ BuildGui() {
     G.Add("Text", "x26 y52 w300 h18 Background" C.bg, "режимы освещённости для игры")
     G.SetFont("s9 bold")
     ui.status := G.Add("Text", "x510 y22 w172 h30 Center 0x200 Background" C.panel, "")
+    G.SetFont("s8 bold c" C.warn)
+    ui.hdr := G.Add("Text", "x382 y56 w300 h16 Right 0x100 Background" C.bg, "")
 
     ; монитор
     Section(92, "МОНИТОР")
@@ -605,8 +732,9 @@ BuildGui() {
         ui.graph.Push(pic)
         G.SetFont("s10 norm c" C.text)
         b := G.Add("Text", "x66 y" y " w200 h38 0x200 0x100 Background" C.panel, "")
-        Clickable(b, ModeClick(i), "Включить режим")
+        Clickable(b, ModeClick(i), "Клик — включить режим.`nПравый клик — изменить, экспорт в .cube, удалить.")
         ui.modeBtn.Push(b)
+        ROW_OF[pic.Hwnd] := i, ROW_OF[b.Hwnd] := i
         if i > 1
             AddStrength(i, y)
         AddChip(i, y)
@@ -616,8 +744,17 @@ BuildGui() {
         AddBlock(i, y)
     }
 
+    ; инструменты
+    y := 180 + n * 46
+    t := AddPill(24, y, 242, "＋   Новый режим")
+    Clickable(t, (*) => OpenEditor(0), "Редактор: экспозиция, гамма, контраст, тени, света,`nтемпература, насыщенность и кривая мышкой")
+    t := AddPill(274, y, 260, "Импорт LUT (.cube)")
+    Clickable(t, (*) => ImportCube(), "Добавить режим из файла .cube (1D или 3D LUT)")
+    t := AddPill(542, y, 140, "Папка curves")
+    Clickable(t, (*) => Run(CURVE_DIR), "Открыть папку с файлами режимов")
+
     ; цикл
-    y := 180 + n * 46 + 12
+    y += 46 + 12
     Section(y, "ЦИКЛИЧЕСКОЕ ПЕРЕКЛЮЧЕНИЕ")
     y += 22
     for row in [[n + 1, "↓     Следующий режим"], [n + 2, "↑     Предыдущий режим"]] {
@@ -642,16 +779,25 @@ BuildGui() {
     ui.detect := G.Add("Text", "x542 y" y " w140 h38 Center 0x200 0x100 Background" C.accentDim, "Определить")
     Clickable(ui.detect, (*) => DetectGame(), "Через 5 секунд запомнить активное окно как окно игры")
     y += 46
-    ui.osd := AddPill(24, y, 200, "Подпись на экране")
+    ui.osd := AddPill(24, y, 150, "Подпись")
     Clickable(ui.osd, (*) => ToggleOsd(),
         "При переключении горячей клавишей на секунду показывать название режима поверх игры.`nНе видно в эксклюзивном полноэкранном режиме.")
+    ui.vibPill := AddPill(182, y, 200, "Насыщенность")
+    ui.vibVal := AddStepper(390, y, (*) => SetVib(cfg.vib - 5), (*) => SetVib(cfg.vib + 5),
+        "Насыщенность NVIDIA (Digital Vibrance) в игре.`n50% — стандарт, больше — ярче цвета.")
+    if NvAvailable()
+        Clickable(ui.vibPill, (*) => ToggleVib(), "Менять насыщенность NVIDIA в игре (вне игры — исходная).`nУ своих режимов может быть своя насыщенность — задаётся в редакторе.")
+    else
+        Clickable(ui.vibPill, (*) => Notify("Насыщенность работает только на видеокартах NVIDIA", "warn"), "Нужна видеокарта NVIDIA")
+    ui.auto := AddPill(542, y, 140, "Автозапуск")
+    Clickable(ui.auto, (*) => ToggleAutostart(), "Запускать Lumen при входе в Windows, свёрнутым в трей.`nС правами администратора — без окна UAC.")
 
     ; подсказка и уведомления
     y += 52
     G.SetFont("s8 norm c" C.muted)
     G.Add("Text", "x24 y" y " w658 h30 Background" C.bg,
-        "Клик по режиму — включить.  Клик по клавише — назначить (Backspace — удалить, Esc — отмена).`n"
-        "«Блок» — нажатие не дойдёт до Windows и игры.  Свои кривые — файлы .crv3 в папке curves.")
+        "Клик по режиму — включить, правый клик — изменить / экспорт / удалить.  Клик по клавише — назначить`n"
+        "(Backspace — удалить, Esc — отмена).  «Блок» — нажатие не дойдёт до игры.  Крестик сворачивает в трей.")
     y += 38
     G.SetFont("s9 norm c" C.muted)
     ui.note := G.Add("Text", "x24 y" (y + 2) " w620 h20 0x200 Background" C.bg, "")
@@ -668,10 +814,12 @@ BuildGui() {
     tray.Delete()
     tray.Add("Открыть", (*) => G.Show())
     tray.Add("Стандартная настройка", (*) => SelectMode(1, true))
+    tray.Add("Новый режим…", (*) => OpenEditor(0))
     tray.Add()
-    tray.Add("Перезапустить (перечитать кривые)", (*) => Reload())
+    tray.Add("Перезапустить (перечитать кривые)", (*) => RestartLumen())
     tray.Add("Выход", (*) => ExitApp())
     tray.Default := "Открыть"
+    tray.ClickCount := 1
 
     loop n + 2
         ShowChip(A_Index), ShowBlock(A_Index)
@@ -679,10 +827,12 @@ BuildGui() {
         SetPill(ui.cyc[A_Index], cfg.cycle[A_Index])
     SetPill(ui.lock, cfg.lockOn)
     SetPill(ui.osd, cfg.osd)
+    SetPill(ui.auto, AutostartIsOn())
+    ShowVib()
     ShowGame()
     UpdateModeRows()
     UpdateStatus()
-    G.Show("w706 h" (y + 34))
+    G.Show("w706 h" (y + 34) (START_HIDDEN ? " Hide" : ""))
 }
 
 Section(y, text) {
@@ -703,18 +853,24 @@ AddBlock(i, y) {
     ui.blk.Push(b)
 }
 
+; Кнопки [−] значение [+], возвращает поле значения
+AddStepper(x, y, onMinus, onPlus, tip) {
+    G.SetFont("s11 bold c" C.muted)
+    m := G.Add("Text", "x" x " y" y " w26 h38 Center 0x200 0x100 Background" C.panel2, "−")
+    Clickable(m, onMinus, "Меньше")
+    G.SetFont("s9 bold c" C.text)
+    v := G.Add("Text", "x" (x + 28) " y" y " w52 h38 Center 0x200 0x100 Background" C.panel2, "")
+    TIPS[v.Hwnd] := tip
+    G.SetFont("s11 bold c" C.muted)
+    p := G.Add("Text", "x" (x + 82) " y" y " w26 h38 Center 0x200 0x100 Background" C.panel2, "+")
+    Clickable(p, onPlus, "Больше")
+    return v
+}
+
 ; Сила режима: [−] 70% [+]
 AddStrength(i, y) {
-    G.SetFont("s11 bold c" C.muted)
-    m := G.Add("Text", "x274 y" y " w26 h38 Center 0x200 0x100 Background" C.panel2, "−")
-    Clickable(m, StrengthStep(i, -10), "Слабее")
-    G.SetFont("s9 bold c" C.text)
-    v := G.Add("Text", "x302 y" y " w52 h38 Center 0x200 0x100 Background" C.panel2, "")
-    TIPS[v.Hwnd] := "Сила режима: 100% — кривая как есть,`nменьше — ближе к стандартной"
-    G.SetFont("s11 bold c" C.muted)
-    p := G.Add("Text", "x356 y" y " w26 h38 Center 0x200 0x100 Background" C.panel2, "+")
-    Clickable(p, StrengthStep(i, 10), "Сильнее")
-    ui.str[i] := v
+    ui.str[i] := AddStepper(274, y, StrengthStep(i, -10), StrengthStep(i, 10),
+        "Сила режима: 100% — кривая как есть,`nменьше — ближе к стандартной")
     ShowStrength(i)
 }
 
@@ -763,6 +919,78 @@ ShowStrength(i) {
     v := ui.str[i]
     v.SetFont("c" (cfg.strength[i] = 100 ? C.muted : C.accentText))
     v.Text := cfg.strength[i] "%"
+}
+
+ToggleVib() {
+    cfg.vibOn := !cfg.vibOn
+    ShowVib()
+    SaveConfig()
+    ApplyVibrance(VibTarget())
+}
+
+SetVib(v) {
+    v := Max(0, Min(100, v))
+    if v = cfg.vib
+        return
+    cfg.vib := v, cfg.vibOn := true
+    ShowVib()
+    SaveConfig()
+    ApplyVibrance(VibTarget())
+}
+
+ShowVib() {
+    SetPill(ui.vibPill, cfg.vibOn)
+    ui.vibVal.SetFont("c" (cfg.vibOn ? C.accentText : C.muted))
+    ui.vibVal.Text := cfg.vib "%"
+}
+
+ToggleAutostart() {
+    want := !AutostartIsOn()
+    if !SetAutostart(want)
+        Notify("Не удалось изменить автозапуск", "warn")
+    else
+        Notify(want ? "Lumen будет запускаться при входе в Windows" : "Автозапуск выключен", "ok")
+    SetPill(ui.auto, AutostartIsOn())
+}
+
+OnMainClose(*) {
+    if !cfg.trayHint {
+        cfg.trayHint := true
+        SaveConfig()
+        TrayTip("Lumen продолжает работать в трее. Выход — правый клик по значку.", "Lumen", "Iconi")
+    }
+    G.Hide()
+    return true
+}
+
+; Правый клик по режиму
+OnMainContext(guiObj, ctrl, *) {
+    if !ctrl || !ROW_OF.Has(ctrl.Hwnd)
+        return
+    i := ROW_OF[ctrl.Hwnd]
+    m := Menu()
+    if i = 1 {
+        m.Add("Новый режим…", (*) => OpenEditor(0))
+    } else {
+        m.Add(MODES[i].params != "" ? "Изменить в редакторе…" : "Создать режим на основе этого…", (*) => OpenEditor(i))
+        m.Add("Экспорт в .cube…", (*) => ExportCube(i))
+        if !IsBuiltin(i)
+            m.Add("Удалить режим", (*) => DeleteMode(i))
+    }
+    m.Add()
+    m.Add("Открыть папку curves", (*) => Run(CURVE_DIR))
+    m.Show()
+}
+
+DeleteMode(i) {
+    if MsgBox("Удалить режим «" MODES[i].name "»?`nФайл " MODES[i].file " уйдёт в корзину.", "Lumen", "YesNo Icon? Owner" G.Hwnd) != "Yes"
+        return
+    try FileRecycle(CURVE_DIR MODES[i].file)
+    catch {
+        Notify("Не удалось удалить файл", "warn")
+        return
+    }
+    RestartLumen()
 }
 
 ShowChip(i) {
@@ -879,10 +1107,16 @@ OnMonitorChange(*) {
         for x in now
             if x = d
                 keep := true
-        if !keep
+        if !keep {
             SetRamp(d, IDENTITY)
+            if VIB_ORIG.Has(d)
+                NvSetVib(d, VIB_ORIG[d])
+            if VIB_EXPECT.Has(d)
+                VIB_EXPECT.Delete(d)
+        }
     }
     ApplyCurrent()
+    UpdateHdr()
 }
 
 ToggleLock() {
@@ -951,18 +1185,18 @@ ClearNote() => Notify("")
 ShowHelp() {
     MsgBox(
         "Если режимы не меняют яркость:`n`n"
-        "1. Панель управления NVIDIA → Дисплей → «Регулировка параметров цвета рабочего стола» → "
+        "1. HDR. В режиме HDR Windows игнорирует гамма-кривые — выключите HDR: "
+        "Параметры → Система → Дисплей. Насыщенность NVIDIA при этом работает.`n`n"
+        "2. Панель управления NVIDIA → Дисплей → «Регулировка параметров цвета рабочего стола» → "
         "снимите галочку «Приоритет эталонного режима».`n`n"
-        "2. Windows может не принимать сильные изменения гаммы. Это снимается параметром реестра:`n"
-        "    HKLM\SOFTWARE\Microsoft\Windows NT\CurrentVersion\ICM`n"
-        "    DWORD  GdiIcmGammaRange = 256`n"
-        "и перезагрузкой.`n`n"
-        "3. Запускайте игру в оконном режиме без рамки — в эксклюзивном полноэкранном режиме "
+        "3. Windows может не принимать сильные изменения гаммы. Запустите tools\enable-gamma-range.reg "
+        "(параметр GdiIcmGammaRange = 256 в HKLM\SOFTWARE\Microsoft\Windows NT\CurrentVersion\ICM) "
+        "и перезагрузитесь.`n`n"
+        "4. Запускайте игру в оконном режиме без рамки — в эксклюзивном полноэкранном режиме "
         "игра может сбрасывать гамму, и подпись режима не видна. Lumen сам ставит кривую заново, "
         "если её сбросили, но другие программы управления гаммой (f.lux и т.п.) лучше закрыть.`n`n"
-        "Свои режимы: положите файл .crv3 в папку curves (256 строк «индекс R G B», значения 0–65535). "
-        "Первая строка «; Название» задаёт имя режима. Затем в меню трея — «Перезапустить».",
-        "Lumen — подсказка", "Iconi")
+        "Свои режимы: «＋ Новый режим» (редактор), «Импорт LUT (.cube)» или файл .crv3 в папке curves.",
+        "Lumen — подсказка", "Iconi Owner" G.Hwnd)
 }
 
 ;--- курсор-рука и всплывающие подсказки -----------------------------
@@ -979,12 +1213,12 @@ WM_MOUSEMOVE(wParam, lParam, msg, hwnd) {
         return
     tipHwnd := hwnd
     ToolTip()
-    if TIPS.Has(hwnd)
+    if TIPS.Has(hwnd) && TIPS[hwnd] != ""
         SetTimer(ShowTip, -600)
 }
 
 ShowTip() {
-    if !TIPS.Has(tipHwnd)
+    if !TIPS.Has(tipHwnd) || TIPS[tipHwnd] = ""
         return
     MouseGetPos(, , , &ctl, 2)
     if ctl = tipHwnd {

@@ -1,0 +1,5 @@
+*.ahk  text eol=crlf
+*.crv3 text eol=crlf
+*.md   text eol=crlf
+*.txt  text eol=crlf
+*.ico  binary

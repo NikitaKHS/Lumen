@@ -424,11 +424,12 @@ ApplyHotkeys() {
 
 CheckGame() {
     global inGame, showing
-    g := !OutsideGame()
+    ; внимание: имена в AHK не различают регистр, локальная «g» перекрыла бы окно G
+    nowIn := !OutsideGame()
     ; окно Lumen активно — показываем выбранный режим, чтобы его можно было посмотреть
-    s := g || !!WinActive("ahk_id " G.Hwnd)
-    if g != inGame {
-        inGame := g
+    s := nowIn || !!WinActive("ahk_id " G.Hwnd)
+    if nowIn != inGame {
+        inGame := nowIn
         ApplyHotkeys()
         UpdateStatus()
     }
@@ -833,7 +834,7 @@ PlotRamp(bits, S, pad, span, ramp, col, dashed := false) {
         prev := y
         if dashed && Mod(x // 2, 2)
             continue
-        lo := Min(y0, y)
+        lo := Max(0, Min(y0, y) - (dashed ? 0 : 1))       ; сплошная линия — 2 px
         loop Max(y0, y) - lo + 1
             NumPut("UInt", col, bits, ((lo + A_Index - 1) * S + pad + x) * 4)
     }

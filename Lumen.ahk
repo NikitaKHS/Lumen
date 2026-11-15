@@ -110,7 +110,7 @@ LoadRamps() {
         buf := Buffer(1536, 0)
         if m.file = "" {
             loop 256 {
-                v := (A_Index - 1) * 256, o := (A_Index - 1) * 2
+                v := (A_Index - 1) * 257, o := (A_Index - 1) * 2
                 NumPut("UShort", v, buf, o), NumPut("UShort", v, buf, 512 + o), NumPut("UShort", v, buf, 1024 + o)
             }
             RAMPS.Push(buf)
